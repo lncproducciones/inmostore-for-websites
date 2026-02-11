@@ -1,0 +1,209 @@
+name: Revisión de Código con IA (Gemini y Mailjet)
+
+on:
+  push:
+    branches:
+      - '**' # Esto activa la acción en todas las ramas
+
+jobs:
+  review-and-email:
+    name: Proceso de Revisión y Envío de Email
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar Repositorio
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Configurar Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Instalar Dependencias
+        run: |
+          pip install google-genai
+
+      - name: Ejecutar Revisión IA y Enviar Correo
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          MJ_USER: ${{ secrets.MAILJET_USER }}
+          MJ_PASS: ${{ secrets.MAILJET_PASS }}
+          MJ_SENDER: "gemini@lncproducciones.com"
+          GITHUB_PUSHER_EMAIL: ${{ github.event.pusher.email }}
+          COMMIT_ID: ${{ github.sha }}
+          BRANCH_NAME: ${{ github.ref_name }}
+          REPO_NAME: ${{ github.repository }}
+        run: |
+          python - <<EOF
+          import os
+          import subprocess
+          import time
+          import re
+          from google import genai
+          import smtplib
+          from email.mime.text import MIMEText
+          from email.mime.multipart import MIMEMultipart
+
+          # Configuración de respaldo
+          DEFAULT_DEV_TEAM = "devteam@lncproducciones.com"
+
+          # 1. Obtener datos del commit (Diff y Email Real)
+          try:
+              diff = subprocess.check_output(['git', 'diff', 'HEAD~1', 'HEAD']).decode('utf-8')
+          except Exception:
+              diff = "No se pudo obtener el diff del commit."
+
+          # Intentar obtener el email real del autor desde Git
+          author_email = ""
+          try:
+              author_email = subprocess.check_output(['git', 'log', '-1', '--format=%ae']).decode('utf-8').strip()
+          except Exception:
+              pass
+
+          # Lógica de selección de email (Git -> Pusher -> DevTeam)
+          final_recipient = author_email
+          
+          # Si no hay email de git o es el de noreply, usamos el del pusher
+          if not final_recipient or "noreply.github.com" in final_recipient:
+              final_recipient = os.environ.get('GITHUB_PUSHER_EMAIL', '')
+
+          # Si sigue siendo noreply o está vacío, enviamos al equipo de desarrollo
+          if not final_recipient or "noreply.github.com" in final_recipient:
+              print(f"DEBUG: No se detectó correo personal válido. Usando fallback: {DEFAULT_DEV_TEAM}")
+              final_recipient = DEFAULT_DEV_TEAM
+
+          if not diff.strip():
+              print("DEBUG: No hay cambios significativos detectados en el diff.")
+              exit(0)
+
+          # 2. Configurar Nuevo SDK Gemini (google-genai)
+          review_html = ""
+          client = genai.Client(api_key=os.environ['GEMINI_API_KEY'])
+          
+          prompt = f"""
+          Actúa como un Senior Code Reviewer experto. 
+          Analiza los cambios del commit {os.environ['COMMIT_ID']}.
+          Proporciona tu respuesta directamente en formato HTML básico (usa <b>, <ul>, <li>, <p>).
+          
+          Estructura del reporte:
+          1. <b>Resumen de cambios</b>: Describe brevemente qué se hizo.
+          2. <b>Recomendaciones Críticas</b>: Errores, fallos de seguridad o bugs graves.
+          3. <b>Mejores Prácticas (Sugeridas)</b>: Recomendaciones opcionales de estilo o mantenibilidad.
+          4. <b>Veredicto Final</b>: 
+             - Si el código no tiene errores críticos, escribe: "VEREDICTO: COMPLETAMENTE MERGEABLE".
+             - Si hay riesgos de seguridad o errores graves, escribe: "VEREDICTO: REQUIERE REVISIÓN".
+          
+          Responde en español.
+          
+          DIFF:
+          {diff}
+          """
+
+          max_retries = 2
+          model_name = "gemini-2.5-flash"
+          
+          for i in range(max_retries):
+              try:
+                  print(f"DEBUG: Intentando generación con {model_name} (Intento {i+1})...")
+                  response = client.models.generate_content(
+                      model=model_name,
+                      contents=prompt
+                  )
+                  review_html = response.text
+                  break 
+              except Exception as e:
+                  error_msg = str(e)
+                  if "429" in error_msg and i < max_retries - 1:
+                      wait_time = 65
+                      print(f"AVISO: Cuota excedida. Reintentando en {wait_time} segundos...")
+                      time.sleep(wait_time)
+                  else:
+                      review_html = f"<b>Nota:</b> No se pudo completar el análisis debido a límites de cuota.<br><br>Detalles: <i>{error_msg}</i>"
+                      break
+
+          # Lógica visual
+          status_header = ""
+          accent_color = "#1a73e8" 
+          if "COMPLETAMENTE MERGEABLE" in review_html.upper():
+              accent_color = "#28a745"
+              status_header = f'<div style="background-color: #d4edda; color: #155724; padding: 10px 15px; border-radius: 6px; margin-bottom: 15px; border: 1px solid #c3e6cb; font-weight: bold; text-align: center;">✅ CÓDIGO APROBADO PARA MERGE</div>'
+          elif "REQUIERE REVISIÓN" in review_html.upper():
+              accent_color = "#dc3545"
+              status_header = f'<div style="background-color: #f8d7da; color: #721c24; padding: 10px 15px; border-radius: 6px; margin-bottom: 15px; border: 1px solid #f5c6cb; font-weight: bold; text-align: center;">⚠️ SE REQUIERE REVISIÓN TÉCNICA</div>'
+          else:
+              status_header = f'<div style="background-color: #e2e3e5; color: #383d41; padding: 10px 15px; border-radius: 6px; margin-bottom: 15px; border: 1px solid #d6d8db; font-weight: bold; text-align: center;">ℹ️ REPORTE GENERADO</div>'
+
+          # 3. Envío de correo
+          branch_name = os.environ['BRANCH_NAME']
+          repo_full_name = os.environ['REPO_NAME']
+          commit_short = os.environ['COMMIT_ID'][:7]
+          sender_email = os.environ['MJ_SENDER']
+          mj_user = os.environ.get('MJ_USER')
+          mj_pass = os.environ.get('MJ_PASS')
+
+          print(f"DEBUG: Enviando correo final a {final_recipient}...")
+
+          msg = MIMEMultipart()
+          msg['From'] = f"LNC Gemini AI <{sender_email}>"
+          msg['To'] = final_recipient
+          msg['Subject'] = f"Revisión IA - {repo_full_name} ({branch_name})"
+
+          html_body = f"""
+          <html>
+            <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; color: #333; margin: 0; padding: 20px; background-color: #f0f2f5;">
+              <div style="max-width: 600px; margin: auto; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 15px rgba(0,0,0,0.1); border: 1px solid #eeeeee;">
+                <img src="https://www.lncproducciones.com/img/head_datacenter.png" alt="Encabezado LNC" style="width: 100%; display: block;">
+                <div style="padding: 30px;">
+                  <div style="text-align: center; margin-bottom: 25px;">
+                    <h2 style="color: {accent_color}; margin: 0; font-size: 20px;">Reporte de Revisión Automática</h2>
+                    <p style="color: #666; font-size: 13px; margin-top: 5px;">Proyecto: <b>{repo_full_name}</b></p>
+                  </div>
+
+                  <div style="background-color: #fcfcfc; border: 1px solid #eee; padding: 12px; border-radius: 8px; margin-bottom: 20px; font-size: 13px; color: #555;">
+                    <table style="width: 100%; border-collapse: collapse;">
+                      <tr>
+                        <td style="padding: 4px 0;"><b>Repositorio:</b></td>
+                        <td style="padding: 4px 0; text-align: right; color: #333;">{repo_full_name}</td>
+                      </tr>
+                      <tr>
+                        <td style="padding: 4px 0;"><b>Rama:</b></td>
+                        <td style="padding: 4px 0; text-align: right; color: {accent_color};"><b>{branch_name}</b></td>
+                      </tr>
+                      <tr>
+                        <td style="padding: 4px 0;"><b>ID Commit:</b></td>
+                        <td style="padding: 4px 0; text-align: right; font-family: monospace; color: #666;">{commit_short}</td>
+                      </tr>
+                    </table>
+                  </div>
+
+                  {status_header}
+
+                  <div style="background-color: #f8f9fa; padding: 20px; border-radius: 8px; border-left: 4px solid {accent_color}; line-height: 1.6; font-size: 15px;">
+                    {review_html}
+                  </div>
+
+                  <div style="margin-top: 25px; padding-top: 20px; border-top: 1px solid #eee; font-size: 11px; color: #888; text-align: center;">
+                    <p>Notificación enviada a: <b>{final_recipient}</b></p>
+                    <p>© LNC Producciones - Soporte Técnico</p>
+                  </div>
+                </div>
+                <img src="https://www.lncproducciones.com/img/header_slim.jpeg" alt="Footer" style="width: 100%; display: block;">
+              </div>
+            </body>
+          </html>
+          """
+          msg.attach(MIMEText(html_body, 'html'))
+
+          if mj_user and mj_pass:
+              try:
+                  server = smtplib.SMTP('in-v3.mailjet.com', 587, timeout=30)
+                  server.starttls()
+                  server.login(mj_user, mj_pass)
+                  server.sendmail(sender_email, final_recipient, msg.as_string())
+                  server.quit()
+                  print(f"SUCCESS: Correo enviado a {final_recipient}.")
+              except Exception as e:
+                  print(f"ERROR SMTP: {str(e)}")
+                  exit(1)
+          EOF
